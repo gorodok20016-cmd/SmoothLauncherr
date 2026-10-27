@@ -1,1 +1,625 @@
+name: Build APK
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project
+        run: |
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "SmoothLauncher"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.smooth.launcher"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.smooth.launcher"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.recyclerview:recyclerview:1.3.2")
+              implementation("androidx.dynamicanimation:dynamicanimation:1.0.0")
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+              <application
+                  android:label="Smooth"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:theme="@style/Theme.L">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:stateNotNeeded="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize"
+                      android:windowSoftInputMode="stateAlwaysHidden|adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.HOME" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/styles.xml <<'EOF_FILE'
+          <resources>
+              <style name="Theme.L" parent="android:Theme.Material.Wallpaper.NoTitleBar">
+                  <item name="android:windowShowWallpaper">true</item>
+                  <item name="android:windowIsTranslucent">true</item>
+                  <item name="android:windowBackground">@android:color/transparent</item>
+                  <item name="android:statusBarColor">@android:color/transparent</item>
+                  <item name="android:navigationBarColor">@android:color/transparent</item>
+              </style>
+          </resources>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/smooth/launcher
+          cat > app/src/main/java/com/smooth/launcher/MainActivity.kt <<'EOF_FILE'
+          package com.smooth.launcher
 
+          import android.app.Activity
+          import android.app.ActivityOptions
+          import android.content.BroadcastReceiver
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.provider.Settings
+          import android.text.Editable
+          import android.text.TextUtils
+          import android.text.TextWatcher
+          import android.util.TypedValue
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.VelocityTracker
+          import android.view.View
+          import android.view.ViewConfiguration
+          import android.view.ViewGroup
+          import android.view.inputmethod.EditorInfo
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.EditText
+          import android.widget.FrameLayout
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.PopupMenu
+          import android.widget.TextClock
+          import android.widget.TextView
+          import androidx.core.graphics.drawable.toBitmap
+          import androidx.core.view.ViewCompat
+          import androidx.core.view.WindowCompat
+          import androidx.core.view.WindowInsetsCompat
+          import androidx.dynamicanimation.animation.DynamicAnimation
+          import androidx.dynamicanimation.animation.SpringAnimation
+          import androidx.dynamicanimation.animation.SpringForce
+          import androidx.recyclerview.widget.GridLayoutManager
+          import androidx.recyclerview.widget.RecyclerView
+          import java.util.concurrent.Executors
+          import kotlin.math.abs
+
+          class AppItem(val label: String, val cn: ComponentName, val icon: Bitmap)
+
+          /** Корневой контейнер: тянет шторку приложений за пальцем и плавно «доводит» её пружиной. */
+          class SwipeRoot(c: Context) : FrameLayout(c) {
+              lateinit var drawer: View
+              lateinit var grid: RecyclerView
+              var onProgress: (Float) -> Unit = {}
+              var onState: (Boolean) -> Unit = {}
+              var isOpen = false
+                  private set
+
+              private val slop = ViewConfiguration.get(c).scaledTouchSlop
+              private var downX = 0f
+              private var downY = 0f
+              private var lastY = 0f
+              private var dragging = false
+              private var vt: VelocityTracker? = null
+              private var spring: SpringAnimation? = null
+              private val maxT: Float get() = height.toFloat()
+
+              fun setTranslation(t: Float) {
+                  if (height == 0) return
+                  val v = t.coerceIn(0f, maxT)
+                  drawer.translationY = v
+                  onProgress(1f - v / maxT)
+              }
+
+              fun settle(open: Boolean, vel: Float = 0f) {
+                  if (height == 0) return
+                  spring?.cancel()
+                  isOpen = open
+                  onState(open)
+                  val target = if (open) 0f else maxT
+                  spring = SpringAnimation(drawer, DynamicAnimation.TRANSLATION_Y).apply {
+                      setSpring(
+                          SpringForce(target)
+                              .setDampingRatio(SpringForce.DAMPING_RATIO_NO_BOUNCY)
+                              .setStiffness(380f)
+                      )
+                      setMinValue(0f)
+                      setMaxValue(maxT)
+                      setStartVelocity(vel)
+                      addUpdateListener { _, v, _ -> onProgress(1f - v / maxT) }
+                      start()
+                  }
+              }
+
+              fun snapClosed() {
+                  spring?.cancel()
+                  isOpen = false
+                  setTranslation(maxT)
+              }
+
+              override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+                  super.onSizeChanged(w, h, ow, oh)
+                  if (!dragging && spring?.isRunning != true) setTranslation(if (isOpen) 0f else maxT)
+              }
+
+              private fun shouldDrag(e: MotionEvent): Boolean {
+                  val dy = e.y - downY
+                  val dx = e.x - downX
+                  if (abs(dy) <= slop || abs(dy) <= abs(dx)) return false
+                  val up = dy < 0
+                  return (!isOpen && up) || (isOpen && !up && !grid.canScrollVertically(-1))
+              }
+
+              private fun startDrag(e: MotionEvent) {
+                  spring?.cancel()
+                  dragging = true
+                  lastY = downY
+                  move(e)
+              }
+
+              private fun move(e: MotionEvent) {
+                  val dy = e.y - lastY
+                  lastY = e.y
+                  setTranslation(drawer.translationY + dy)
+              }
+
+              override fun onInterceptTouchEvent(e: MotionEvent): Boolean {
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          downX = e.x; downY = e.y; lastY = e.y; dragging = false
+                          vt?.recycle(); vt = VelocityTracker.obtain(); vt!!.addMovement(e)
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          vt?.addMovement(e)
+                          if (!dragging && shouldDrag(e)) { startDrag(e); return true }
+                      }
+                  }
+                  return false
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  vt?.addMovement(e)
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          downX = e.x; downY = e.y; lastY = e.y
+                          if (vt == null) { vt = VelocityTracker.obtain(); vt!!.addMovement(e) }
+                          return true
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          if (!dragging && shouldDrag(e)) startDrag(e)
+                          else if (dragging) move(e)
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                          if (dragging) {
+                              vt?.computeCurrentVelocity(1000)
+                              val vy = vt?.yVelocity ?: 0f
+                              val open = when {
+                                  vy < -900f -> true
+                                  vy > 900f -> false
+                                  else -> drawer.translationY < maxT / 2f
+                              }
+                              settle(open, vy)
+                          }
+                          dragging = false
+                          vt?.recycle(); vt = null
+                      }
+                  }
+                  return true
+              }
+          }
+
+          class MainActivity : Activity() {
+
+              private lateinit var root: SwipeRoot
+              private lateinit var home: FrameLayout
+              private lateinit var dock: LinearLayout
+              private lateinit var dim: View
+              private lateinit var drawer: LinearLayout
+              private lateinit var grid: RecyclerView
+              private lateinit var search: EditText
+              private lateinit var adapter: AppAdapter
+              private lateinit var clockBox: LinearLayout
+              private lateinit var bottomBox: LinearLayout
+
+              private var all: List<AppItem> = emptyList()
+              private var closedApplied = true
+              private val io = Executors.newSingleThreadExecutor()
+
+              private val pkgReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context?, i: Intent?) { loadApps() }
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  WindowCompat.setDecorFitsSystemWindows(window, false)
+                  window.statusBarColor = Color.TRANSPARENT
+                  window.navigationBarColor = Color.TRANSPARENT
+                  if (Build.VERSION.SDK_INT >= 29) window.isNavigationBarContrastEnforced = false
+
+                  adapter = AppAdapter()
+                  root = SwipeRoot(this)
+
+                  dim = View(this).apply { setBackgroundColor(Color.BLACK); alpha = 0f }
+
+                  // ---------- Главный экран ----------
+                  home = FrameLayout(this)
+                  val time = TextClock(this).apply {
+                      format12Hour = "h:mm"
+                      format24Hour = "HH:mm"
+                      setTextColor(Color.WHITE)
+                      setTextSize(TypedValue.COMPLEX_UNIT_SP, 76f)
+                      typeface = Typeface.create("sans-serif-thin", Typeface.NORMAL)
+                      setShadowLayer(16f, 0f, 2f, Color.parseColor("#55000000"))
+                      includeFontPadding = false
+                  }
+                  val date = TextClock(this).apply {
+                      format12Hour = "EEEE, d MMMM"
+                      format24Hour = "EEEE, d MMMM"
+                      setTextColor(Color.parseColor("#E6FFFFFF"))
+                      setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                      setShadowLayer(10f, 0f, 1f, Color.parseColor("#55000000"))
+                  }
+                  clockBox = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      addView(time)
+                      addView(date)
+                  }
+                  home.addView(clockBox, FrameLayout.LayoutParams(
+                      ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                      Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                  ).apply { topMargin = dp(56) })
+
+                  dock = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      setPadding(dp(8), dp(12), dp(8), dp(12))
+                      background = GradientDrawable().apply {
+                          setColor(Color.parseColor("#33FFFFFF"))
+                          cornerRadius = dp(32).toFloat()
+                      }
+                  }
+                  val handle = View(this).apply {
+                      background = GradientDrawable().apply {
+                          setColor(Color.parseColor("#88FFFFFF"))
+                          cornerRadius = dp(2).toFloat()
+                      }
+                  }
+                  bottomBox = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      addView(handle, LinearLayout.LayoutParams(dp(36), dp(4)).apply { bottomMargin = dp(14) })
+                      addView(dock)
+                  }
+                  home.addView(bottomBox, FrameLayout.LayoutParams(
+                      ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                      Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                  ).apply { bottomMargin = dp(20) })
+
+                  // ---------- Шторка приложений ----------
+                  search = EditText(this).apply {
+                      hint = "Поиск приложений"
+                      setHintTextColor(Color.parseColor("#99FFFFFF"))
+                      setTextColor(Color.WHITE)
+                      setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                      setSingleLine()
+                      imeOptions = EditorInfo.IME_ACTION_SEARCH
+                      setPadding(dp(20), dp(12), dp(20), dp(12))
+                      background = GradientDrawable().apply {
+                          setColor(Color.parseColor("#33FFFFFF"))
+                          cornerRadius = dp(28).toFloat()
+                      }
+                      addTextChangedListener(object : TextWatcher {
+                          override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                          override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                          override fun afterTextChanged(s: Editable?) { applyFilter() }
+                      })
+                      setOnEditorActionListener { v, _, _ ->
+                          adapter.items.firstOrNull()?.let { launch(it, v) }
+                          true
+                      }
+                  }
+                  grid = RecyclerView(this).apply {
+                      layoutManager = GridLayoutManager(this@MainActivity, 4)
+                      adapter = this@MainActivity.adapter
+                      itemAnimator = null
+                      setHasFixedSize(true)
+                      setItemViewCacheSize(24)
+                      clipToPadding = false
+                      setPadding(dp(12), 0, dp(12), dp(24))
+                  }
+                  drawer = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      visibility = View.INVISIBLE
+                      addView(search, LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                      ).apply { setMargins(dp(20), dp(8), dp(20), dp(12)) })
+                      addView(grid, LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+                      ))
+                  }
+
+                  root.drawer = drawer
+                  root.grid = grid
+                  root.onProgress = { p -> applyProgress(p.coerceIn(0f, 1f)) }
+                  root.onState = { open -> if (!open) hideKeyboard() }
+
+                  val mp = ViewGroup.LayoutParams.MATCH_PARENT
+                  root.addView(dim, FrameLayout.LayoutParams(mp, mp))
+                  root.addView(home, FrameLayout.LayoutParams(mp, mp))
+                  root.addView(drawer, FrameLayout.LayoutParams(mp, mp))
+                  setContentView(root)
+
+                  ViewCompat.setOnApplyWindowInsetsListener(root) { _, ins ->
+                      val b = ins.getInsets(WindowInsetsCompat.Type.systemBars())
+                      home.setPadding(b.left, b.top, b.right, b.bottom)
+                      drawer.setPadding(b.left, b.top + dp(8), b.right, b.bottom)
+                      ins
+                  }
+
+                  val f = IntentFilter().apply {
+                      addAction(Intent.ACTION_PACKAGE_ADDED)
+                      addAction(Intent.ACTION_PACKAGE_REMOVED)
+                      addAction(Intent.ACTION_PACKAGE_REPLACED)
+                      addDataScheme("package")
+                  }
+                  if (Build.VERSION.SDK_INT >= 33) registerReceiver(pkgReceiver, f, Context.RECEIVER_EXPORTED)
+                  else registerReceiver(pkgReceiver, f)
+
+                  loadApps()
+              }
+
+              private fun applyProgress(p: Float) {
+                  home.alpha = (1f - p * 1.3f).coerceIn(0f, 1f)
+                  val s = 1f - 0.06f * p
+                  home.scaleX = s
+                  home.scaleY = s
+                  dim.alpha = p * 0.55f
+                  drawer.alpha = (p * 1.6f).coerceAtMost(1f)
+                  drawer.visibility = if (p <= 0.001f) View.INVISIBLE else View.VISIBLE
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      runCatching { window.setBackgroundBlurRadius((p * 80).toInt()) }
+                  }
+                  if (p <= 0.001f) {
+                      if (!closedApplied) {
+                          closedApplied = true
+                          if (search.text.isNotEmpty()) search.setText("")
+                          grid.scrollToPosition(0)
+                      }
+                  } else closedApplied = false
+              }
+
+              private fun hideKeyboard() {
+                  val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                  imm.hideSoftInputFromWindow(root.windowToken, 0)
+                  search.clearFocus()
+              }
+
+              private fun loadApps() {
+                  io.execute {
+                      val pm = packageManager
+                      val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                      val size = dp(64)
+                      val list = pm.queryIntentActivities(q, 0)
+                          .filter { it.activityInfo.packageName != packageName }
+                          .map {
+                              AppItem(
+                                  it.loadLabel(pm).toString(),
+                                  ComponentName(it.activityInfo.packageName, it.activityInfo.name),
+                                  it.loadIcon(pm).toBitmap(size, size)
+                              )
+                          }
+                          .sortedBy { it.label.lowercase() }
+                      runOnUiThread { all = list; applyFilter(); buildDock() }
+                  }
+              }
+
+              private fun applyFilter() {
+                  val q = search.text.toString().trim().lowercase()
+                  adapter.items = if (q.isEmpty()) all else all.filter { it.label.lowercase().contains(q) }
+                  adapter.notifyDataSetChanged()
+              }
+
+              private fun buildDock() {
+                  dock.removeAllViews()
+                  val intents = listOf(
+                      Intent(Intent.ACTION_DIAL),
+                      Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_MESSAGING),
+                      Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com")),
+                      Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+                  )
+                  val seen = HashSet<String>()
+                  for (i in intents) {
+                      val pkg = packageManager.resolveActivity(i, PackageManager.MATCH_DEFAULT_ONLY)
+                          ?.activityInfo?.packageName ?: continue
+                      val app = all.firstOrNull { it.cn.packageName == pkg } ?: continue
+                      if (!seen.add(pkg)) continue
+                      dock.addView(dockIcon(app))
+                  }
+              }
+
+              private fun dockIcon(a: AppItem): View = ImageView(this).apply {
+                  setImageBitmap(a.icon)
+                  layoutParams = LinearLayout.LayoutParams(dp(56), dp(56)).apply { setMargins(dp(10), 0, dp(10), 0) }
+                  pressFeedback(this)
+                  setOnClickListener { launch(a, this) }
+              }
+
+              private fun pressFeedback(v: View) {
+                  v.setOnTouchListener { view, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN ->
+                              view.animate().scaleX(0.88f).scaleY(0.88f).setDuration(110).start()
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                              view.animate().scaleX(1f).scaleY(1f).setDuration(180).start()
+                      }
+                      false
+                  }
+              }
+
+              private fun launch(a: AppItem, v: View) {
+                  val i = Intent(Intent.ACTION_MAIN)
+                      .addCategory(Intent.CATEGORY_LAUNCHER)
+                      .setComponent(a.cn)
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+                  val o = ActivityOptions.makeScaleUpAnimation(v, 0, 0, v.width, v.height)
+                  runCatching { startActivity(i, o.toBundle()) }
+              }
+
+              private fun showMenu(a: AppItem, v: View) {
+                  val pm = PopupMenu(this, v)
+                  pm.menu.add("О приложении")
+                  pm.menu.add("Удалить")
+                  pm.setOnMenuItemClickListener { m ->
+                      val u = Uri.parse("package:" + a.cn.packageName)
+                      runCatching {
+                          if (m.title.toString() == "Удалить") startActivity(Intent(Intent.ACTION_DELETE, u))
+                          else startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, u))
+                      }
+                      true
+                  }
+                  pm.show()
+              }
+
+              inner class AppAdapter : RecyclerView.Adapter<AppAdapter.VH>() {
+                  var items: List<AppItem> = emptyList()
+
+                  inner class VH(val box: LinearLayout, val img: ImageView, val tv: TextView) :
+                      RecyclerView.ViewHolder(box)
+
+                  override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
+                      val ctx = parent.context
+                      val box = LinearLayout(ctx).apply {
+                          orientation = LinearLayout.VERTICAL
+                          gravity = Gravity.CENTER_HORIZONTAL
+                          setPadding(0, dp(10), 0, dp(10))
+                          layoutParams = RecyclerView.LayoutParams(
+                              ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                          )
+                      }
+                      val img = ImageView(ctx).apply { layoutParams = LinearLayout.LayoutParams(dp(56), dp(56)) }
+                      val tv = TextView(ctx).apply {
+                          setTextColor(Color.WHITE)
+                          setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                          maxLines = 1
+                          ellipsize = TextUtils.TruncateAt.END
+                          gravity = Gravity.CENTER
+                          setPadding(dp(4), dp(6), dp(4), 0)
+                          setShadowLayer(4f, 0f, 1f, Color.parseColor("#88000000"))
+                      }
+                      box.addView(img)
+                      box.addView(tv)
+                      pressFeedback(box)
+                      return VH(box, img, tv)
+                  }
+
+                  override fun onBindViewHolder(h: VH, position: Int) {
+                      val a = items[position]
+                      h.img.setImageBitmap(a.icon)
+                      h.tv.text = a.label
+                      h.box.setOnClickListener { launch(a, h.box) }
+                      h.box.setOnLongClickListener { showMenu(a, h.box); true }
+                  }
+
+                  override fun getItemCount() = items.size
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() {
+                  if (root.isOpen) root.settle(false)
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  if (root.isOpen) root.settle(false)
+              }
+
+              override fun onStop() {
+                  super.onStop()
+                  root.snapClosed()
+              }
+
+              override fun onDestroy() {
+                  runCatching { unregisterReceiver(pkgReceiver) }
+                  io.shutdown()
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SmoothLauncher
+          path: app/build/outputs/apk/debug/app-debug.apk
